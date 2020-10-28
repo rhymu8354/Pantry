@@ -57,9 +57,37 @@ type Requester<V> = oneshot::Sender<Sender<V>>;
 type Requestee<V> = oneshot::Receiver<Sender<V>>;
 
 /// This is the trait that values must implement in order to be stored in the
-/// [`Pantry`].
+/// [`Pantry`].  Note that since the trait has an asynchronous method,
+/// currently the [`async_trait`] attribute from the [`async-trait`] crate must
+/// be added to implementations.
+///
+/// # Examples
+///
+/// ```rust
+/// # extern crate async_std;
+/// # extern crate async_trait;
+/// # extern crate pantry;
+/// use async_trait::async_trait;
+/// use pantry::Perishable;
+///
+/// struct SpyOrders(String);
+///
+/// #[async_trait]
+/// impl Perishable for SpyOrders {
+///     async fn perished(&mut self) {
+///         // This message will self-destruct after
+///         // sitting in the pantry for 5 seconds!
+///         async_std::future::timeout(
+///             std::time::Duration::from_secs(5),
+///             futures::future::pending::<()>()
+///         ).await.unwrap_or(())
+///     }
+/// }
+/// ```
 ///
 /// [`Pantry`]: struct.Pantry.html
+/// [`async_trait`]: https://docs.rs/async-trait/0.1.41/async_trait/index.html
+/// [`async-trait`]: https://docs.rs/async-trait/0.1.41/async_trait/
 #[async_trait]
 pub trait Perishable: Send + 'static {
     /// This asynchronous function should complete once the value has "decayed"
@@ -412,8 +440,58 @@ enum WorkerMessage<K, V> {
 /// [`perished`] functions complete.
 ///
 /// As long as the [`perished`] future remains uncompleted for a value, the
-/// value remains held in the collection and can be retrieved calling [`fetch`]
-/// with the same key used to store the value in the first place.
+/// value remains held in the collection and can be retrieved by calling
+/// [`fetch`] with the same key used to store the value in the first place.
+///
+/// # Examples
+///
+/// ```rust
+/// # extern crate async_std;
+/// # extern crate async_trait;
+/// # extern crate pantry;
+/// use async_trait::async_trait;
+/// use futures::executor::block_on;
+/// use pantry::{Pantry, Perishable};
+/// use std::time::Duration;
+///
+/// async fn delay_async(duration: Duration) {
+///     async_std::future::timeout(
+///         duration,
+///         futures::future::pending::<()>()
+///     ).await.unwrap_or(())
+/// }
+///
+/// fn delay(duration: Duration) {
+///     block_on(delay_async(duration));
+/// }
+///
+/// struct SpyOrders(&'static str);
+///
+/// #[async_trait]
+/// impl Perishable for SpyOrders {
+///     async fn perished(&mut self) {
+///         // This message will self-destruct after
+///         // sitting in the pantry for 150 milliseconds!
+///         delay_async(Duration::from_millis(150)).await
+///     }
+/// }
+///
+/// fn main() {
+///     let pantry = Pantry::new();
+///     let for_james = SpyOrders("Steal Dr. Evil's cat");
+///     let for_jason = SpyOrders("Save the Queen");
+///     let key = "spies";
+///     pantry.store(key, for_james);
+///     delay(Duration::from_millis(100));
+///     pantry.store(key, for_jason);
+///     delay(Duration::from_millis(100));
+///     let value1 = block_on(async { pantry.fetch(key).await });
+///     let value2 = block_on(async { pantry.fetch(key).await });
+///     assert!(value1.is_some());
+///     assert_eq!("Save the Queen", value1.unwrap().0);
+///     assert!(value2.is_none());
+/// }
+/// ```
 ///
 /// [`perished`]: trait.Perishable.html#method.perished
 /// [`fetch`]: #method.fetch
@@ -530,4 +608,200 @@ impl<K, V> Drop for Pantry<K, V> {
         // no reason why we shouldn't panic as well.
         self.worker.take().unwrap().join().unwrap();
     }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    struct MockPerishable{
+        num: usize,
+        perish: Option<oneshot::Receiver<()>>,
+        dropped: Option<oneshot::Sender<()>>,
+    }
+
+    impl MockPerishable {
+        fn perishable(num: usize) -> (
+            Self,
+            oneshot::Sender<()>,
+            oneshot::Receiver<()>,
+        ) {
+            let (perish_sender, perish_receiver) = oneshot::channel();
+            let (dropped_sender, dropped_receiver) = oneshot::channel();
+            let value = Self {
+                num,
+                perish: Some(perish_receiver),
+                dropped: Some(dropped_sender),
+            };
+            (value, perish_sender, dropped_receiver)
+        }
+        fn not_perishable(num: usize) -> Self {
+            Self {
+                num,
+                perish: None,
+                dropped: None,
+            }
+        }
+    }
+
+    impl Drop for MockPerishable {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                dropped.send(()).unwrap_or(());
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Perishable for MockPerishable {
+        async fn perished(&mut self) {
+            if let Some(perish) = self.perish.take() {
+                perish.await.unwrap_or(());
+            } else {
+                futures::future::pending().await
+            }
+        }
+    }
+
+    #[test]
+    fn store_then_fetch() {
+        let pantry = Pantry::new();
+        let value = MockPerishable::not_perishable(1337);
+        let key = 42;
+        pantry.store(key, value);
+        let value = futures::executor::block_on(async {
+            pantry.fetch(key).await
+        });
+        assert!(value.is_some());
+        assert_eq!(1337, value.unwrap().num);
+    }
+
+    #[test]
+    fn fetch_without_store() {
+        let pantry: Pantry<usize, MockPerishable> = Pantry::new();
+        let key = 42;
+        let value = futures::executor::block_on(async {
+            pantry.fetch(key).await
+        });
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn store_then_double_fetch() {
+        let pantry = Pantry::new();
+        let value = MockPerishable::not_perishable(1337);
+        let key = 42;
+        pantry.store(key, value);
+        let value = futures::executor::block_on(async {
+            pantry.fetch(key).await
+        });
+        assert!(value.is_some());
+        assert_eq!(1337, value.unwrap().num);
+        let value = futures::executor::block_on(async {
+            pantry.fetch(key).await
+        });
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn double_store_then_double_fetch_same_key() {
+        let pantry = Pantry::new();
+        let value1 = MockPerishable::not_perishable(1337);
+        let value2 = MockPerishable::not_perishable(85);
+        let key = 42;
+        pantry.store(key, value1);
+        pantry.store(key, value2);
+        let value1 = futures::executor::block_on(async {
+            pantry.fetch(key).await
+        });
+        let value2 = futures::executor::block_on(async {
+            pantry.fetch(key).await
+        });
+        assert!(value1.is_some());
+        assert!(value2.is_some());
+        assert!(matches!(
+            (value1.unwrap().num, value2.unwrap().num),
+            (1337, 85)
+            | (85, 1337)
+        ));
+    }
+
+    #[test]
+    fn double_store_then_double_fetch_different_keys() {
+        let pantry = Pantry::new();
+        let value1 = MockPerishable::not_perishable(1337);
+        let value2 = MockPerishable::not_perishable(85);
+        let key1 = 42;
+        let key2 = 33;
+        pantry.store(key1, value1);
+        pantry.store(key2, value2);
+        let value1 = futures::executor::block_on(async {
+            pantry.fetch(key1).await
+        });
+        let value2 = futures::executor::block_on(async {
+            pantry.fetch(key2).await
+        });
+        assert!(value1.is_some());
+        assert!(value2.is_some());
+        assert!(matches!(
+            (value1.unwrap().num, value2.unwrap().num),
+            (1337, 85)
+        ));
+    }
+
+    #[test]
+    fn store_then_perish_then_fetch() {
+        let pantry = Pantry::new();
+        let (value, perish, dropped) = MockPerishable::perishable(1337);
+        let key = 42;
+        pantry.store(key, value);
+        assert!(perish.send(()).is_ok());
+        assert!(futures::executor::block_on(async {
+            dropped.await
+        }).is_ok());
+        let value = futures::executor::block_on(async {
+            pantry.fetch(key).await
+        });
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn store_perishible_then_fetch_without_perish() {
+        let pantry = Pantry::new();
+        let (value, perish, dropped) = MockPerishable::perishable(1337);
+        let key = 42;
+        pantry.store(key, value);
+        let value = futures::executor::block_on(async {
+            pantry.fetch(key).await
+        });
+        assert!(dropped.now_or_never().is_none());
+        drop(perish);
+        assert!(value.is_some());
+        assert_eq!(1337, value.unwrap().num);
+    }
+
+    #[test]
+    fn double_store_then_one_perishes_then_double_fetch_same_key() {
+        let pantry = Pantry::new();
+        let (value1, perish, dropped) = MockPerishable::perishable(1337);
+        let value2 = MockPerishable::not_perishable(85);
+        let key = 42;
+        pantry.store(key, value1);
+        pantry.store(key, value2);
+        assert!(perish.send(()).is_ok());
+        assert!(futures::executor::block_on(async {
+            dropped.await
+        }).is_ok());
+        let value1 = futures::executor::block_on(async {
+            pantry.fetch(key).await
+        });
+        let value2 = futures::executor::block_on(async {
+            pantry.fetch(key).await
+        });
+        assert!(value1.is_some());
+        assert!(value2.is_none());
+        assert_eq!(85, value1.unwrap().num);
+    }
+
 }

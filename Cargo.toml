@@ -13,3 +13,6 @@ repository = "https://github.com/rhymu8354/Pantry.git"
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
+
+[dev-dependencies]
+async-std = "1.6"
