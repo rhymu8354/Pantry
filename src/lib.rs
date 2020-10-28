@@ -46,7 +46,6 @@ use std::{
         HashMap,
         hash_map,
     },
-    fmt::Debug,
     hash::Hash,
     pin::Pin,
     rc::Rc,
@@ -54,8 +53,8 @@ use std::{
 };
 
 type Sender<V> = oneshot::Sender<Option<V>>;
-type Requester<V> = oneshot::Sender<Sender<V> >;
-type Requestee<V> = oneshot::Receiver<Sender<V> >;
+type Requester<V> = oneshot::Sender<Sender<V>>;
+type Requestee<V> = oneshot::Receiver<Sender<V>>;
 
 /// This is the trait that values must implement in order to be stored in the
 /// [`Pantry`].
@@ -81,16 +80,18 @@ pub trait Perishable: Send + 'static {
 async fn monitor_value<V>(
     mut value: V,
     receiver: Requestee<V>,
-) -> bool
+) -> MonitorKind
     where V: Perishable
 {
-    println!("Now monitoring parked value");
+    // The monitor completes if either of the following completes:
     futures::select!(
+        // The value has perished.
         _ = value.perished().fuse() => (),
+
+        // The value has been requested to be fetched back out,
+        // or the requester for the value has been dropped.
         sender = receiver.fuse() => {
-            println!("Received request to recycle value");
             if let Ok(sender) = sender {
-                println!("Sending value to requester");
                 // A failure here means the value requester gave up
                 // waiting for the value.  It shouldn't happen since the
                 // requestee should respond quickly, but it's still possible if
@@ -99,17 +100,27 @@ async fn monitor_value<V>(
                 // value, as if we gave it to them only for them to drop
                 // it.
                 sender.send(Some(value)).unwrap_or(());
-            } else {
-                println!("No path back to requester!");
             }
         },
     );
-    false
+
+    // The output indicates that this isn't the "kick" future used to
+    // wake the worker thread to collect more monitors.
+    MonitorKind::Value
+}
+
+// This is the type of value returned by a completed monitor.  The
+// `monitor_values` function uses this to tell the difference between value
+// monitors and the special "kick" future it adds to ensure the task does not
+// get stuck waiting when there are new monitors to add to its collection.
+enum MonitorKind {
+    Value,
+    Kick,
 }
 
 struct ParkedValuePool<V> {
     requesters: Vec<Requester<V>>,
-    monitors: Vec<Pin<Box<dyn Future<Output=bool>>>>,
+    monitors: Vec<Pin<Box<dyn Future<Output=MonitorKind>>>>,
 }
 
 impl<V> ParkedValuePool<V>
@@ -119,8 +130,21 @@ impl<V> ParkedValuePool<V>
         &mut self,
         value: V,
     ) {
+        // Adding a value actually adds two different things:
         let (sender, receiver) = oneshot::channel();
+
+        // First we store the oneshot sender as the "requester" we can
+        // use later to retrieve the value from the monitor.
         self.requesters.push(sender);
+
+        // Then we store a monitor, which is a future the worker thread
+        // will try to drive to completion in order to fetch or drop
+        // the value.  It holds the value as well as the receiver matching
+        // the "requester", so that the value can be fetched back out of it.
+        //
+        // Note that the monitor will be taken out by the worker thread
+        // the next time it loops.  The caller should "kick" the worker
+        // thread if it's asleep.
         self.monitors.push(monitor_value(value, receiver).boxed());
     }
 
@@ -132,6 +156,8 @@ impl<V> ParkedValuePool<V>
     }
 
     fn remove(&mut self) -> Option<Requester<V>> {
+        // To drop a value early, we need only drop the "requester" for it.
+        // Doing so will wake the monitor since it "cancels" the oneshot.
         self.requesters.pop()
     }
 }
@@ -150,6 +176,43 @@ impl<K, V> ParkedValuePools<K, V> {
     }
 }
 
+async fn give_parked_value<K, V>(
+    pools: &Rc<RefCell<ParkedValuePools<K, V>>>,
+    key: K,
+) -> Option<V>
+    where K: Eq + Hash,
+        V: Perishable
+{
+    // Remove requester from the pools.
+    let requester = match pools.borrow_mut().pools.entry(key) {
+        hash_map::Entry::Occupied(mut entry) => entry.get_mut().remove(),
+        hash_map::Entry::Vacant(_) => None,
+    };
+
+    // Now that the requester is removed from the pools, we can communicate
+    // with its monitor safely to try to fetch the value it's holding.  We
+    // share the pools with the monitor, so it's not safe to hold a mutable
+    // reference when yielding.
+    if let Some(requester) = requester {
+        let (sender, receiver) = oneshot::channel();
+        // It's possible for this to fail if the value has perished and we
+        // managed to take the  requester from the pools before the worker got
+        // around to it.
+        if requester.send(sender).is_err() {
+            None
+        } else {
+            // It's possible for this to fail if the value has perished
+            // while we're waiting for the monitor to receive our request
+            // for the value.
+            receiver
+                .await // <-- Make sure we're not holding the pools here!
+                .unwrap_or(None)
+        }
+    } else {
+        None
+    }
+}
+
 fn take_parked_value<K, V>(
     pools: &Rc<RefCell<ParkedValuePools<K, V>>>,
     key: K,
@@ -158,19 +221,21 @@ fn take_parked_value<K, V>(
     where K: Eq + Hash,
         V: Perishable
 {
+    // First store the value and create the monitor for it.
     pools.borrow_mut().pools.entry(key)
         .or_insert_with(ParkedValuePool::new)
         .add(value);
+
+    // If the worker thread is asleep, we will have a "kick" oneshot sender.
+    // If so, take it and send to it to cause the worker thread to wake up
+    // and collect the monitor to begin driving it to completion.
     if let Some(kick) = pools.borrow_mut().kick.take() {
-        println!("Kicking monitors");
         // It shouldn't be possible for the kick to fail, since the kick
         // receiver isn't dropped until either it receives the kick or
         // the worker is stopped, and this function is only called
         // by the worker.  So if it does fail, we want to know about it
         // since it would mean we have a bug.
         kick.send(()).unwrap();
-    } else {
-        println!("Cannot kick monitors");
     }
 }
 
@@ -178,27 +243,42 @@ async fn handle_messages<K, V>(
     pools: Rc<RefCell<ParkedValuePools<K, V>>>,
     receiver: mpsc::UnboundedReceiver<WorkerMessage<K, V>>
 )
-    where K: Debug + Eq + Hash,
+    where K: Eq + Hash,
         V: Perishable
 {
+    // Drive to completion the stream of messages to the worker thread.
     receiver
+        // The special `Stop` message completes the stream.
         .take_while(|message| future::ready(
             !matches!(message, WorkerMessage::Stop)
         ))
+
+        // Handle messages other than `Stop`.
         .for_each(|message| async {
             match message {
+                // We already handled `Stop` in the `take_while` above;
+                // it causes the stream to end early so we won't get this far.
+                WorkerMessage::Stop => unreachable!(),
+
+                // Taking a value to store in the pantry is easy.
                 WorkerMessage::Take{
                     key,
                     value,
                 } => {
-                    println!("Placing value to {:?} in pool", key);
                     take_parked_value(&pools, key, value);
                 },
+
+                // Giving a value back out is more difficult.  The monitor
+                // created for it when the value was stored owns the value.
+                // Getting it back out requires that we signal the monitor to
+                // pass back ownership.  Once we get it we deliver it back
+                // through the oneshot sender provided with the `Give` message.
+                // It's possible we have nothing to give back, so what we
+                // send back is an `Option<V>` not a `V`.
                 WorkerMessage::Give{
                     key,
                     return_sender,
                 } => {
-                    println!("Asked to recycle value to {:?}", key);
                     // It's possible for this to fail if the user gave up on a
                     // transaction before the worker was able to recycle a
                     // value for use in sending the request.  If this
@@ -207,7 +287,6 @@ async fn handle_messages<K, V>(
                         give_parked_value(&pools, key).await
                     ).unwrap_or(());
                 },
-                WorkerMessage::Stop => unreachable!()
             }
         }).await
 }
@@ -220,34 +299,40 @@ async fn monitor_values<K, V>(
     let mut monitors = Vec::new();
     let mut needs_kick = true;
     loop {
+        // Add to our collection any monitors that have been created since the
+        // last loop.  The first loop picks up any monitors created before the
+        // worker thread actually started.
         monitors.extend(
             pools.borrow_mut().pools.iter_mut()
                 .flat_map(|(_, pool)| {
                     pool.requesters.retain(|requester|
-                        if requester.is_canceled() {
-                            println!("Stream requester canceled");
-                            false
-                        } else {
-                            println!("Stream requester not canceled");
-                            true
-                        }
+                        !requester.is_canceled()
                     );
                     pool.monitors.drain(..)
                 })
         );
+
+        // Drop any empty requester collections.
         pools.borrow_mut().pools.retain(|_, pool|
-            if pool.requesters.is_empty() {
-                println!("Channel pool empty");
-                false
-            } else {
-                println!("Channel pool not empty");
-                true
-            }
+            !pool.requesters.is_empty()
         );
+
+        // Add a special future we lovingly call the "kick", if we haven't
+        // added it yet or if the last one completed.  This future completes if
+        // a special "kick" oneshot is completed, which happens in
+        // `take_parked_value` if the "kick" is set up by the time the worker
+        // thread receives a new monitor to collect.
+        //
+        // If we didn't add this, the worker thread could get stuck if no
+        // previously collected monitor completes (or if there were no previous
+        // monitors collected) after monitors are added but not yet collected.
         if needs_kick {
-            println!("Setting up to kick");
+            // Make a oneshot and store the sender as the "kick" which
+            // `take_parked_value` will use to wake us up.
             let (sender, receiver) = oneshot::channel();
             pools.borrow_mut().kick = Some(sender);
+
+            // Form the "kick" future which completes once the "kick" is made.
             let kick_future = async {
                 // It shouldn't be possible for this to fail, since once the
                 // kick is set up, it isn't dropped until the kick is sent.
@@ -255,102 +340,65 @@ async fn monitor_values<K, V>(
                 // which holds the kick.  So if it does fail, we want to know
                 // about it since it would mean we have a bug.
                 receiver.await.unwrap();
-                true
+
+                // The output indicates that this is the "kick" future used
+                // to wake the worker thread to collect more monitors.
+                MonitorKind::Kick
             }.boxed();
+
+            // Add the "kick" future to our collection.
             monitors.push(kick_future);
-        } else {
-            println!("Already set up to kick");
         }
-        println!("Waiting on monitors ({})", monitors.len());
-        let (kicked, _, monitors_left) = future::select_all(
+
+        // Wait until a monitor or the "kick" completes.
+        let (monitor_kind, _, monitors_left) = future::select_all(
             monitors.into_iter()
         ).await;
-        needs_kick = if kicked {
-            println!("Monitors added");
-            true
-        } else {
-            println!("Monitor completed");
-            false
-        };
+
+        // If it was the "kick" future which completed, mark that we will
+        // need to make a new "kick" for the next loop.
+        needs_kick = matches!(monitor_kind, MonitorKind::Kick);
+
+        // All incomplete futures go back to be collected next loop.
         monitors = monitors_left;
-    }
-}
-
-async fn give_parked_value<K, V>(
-    pools: &Rc<RefCell<ParkedValuePools<K, V>>>,
-    key: K,
-) -> Option<V>
-    where K: Eq + Hash,
-        V: Perishable
-{
-    // Remove connection requester from the pools.
-    let requester = match pools.borrow_mut().pools.entry(key) {
-        hash_map::Entry::Occupied(mut entry) => {
-            println!("Found a connection requester");
-            let requester = entry.get_mut().remove();
-            requester
-        },
-        hash_map::Entry::Vacant(_) => {
-            println!("No connection requesters found");
-            None
-        },
-    };
-
-    // Now that the connection requester is removed from the pools,
-    // we can communicate with its monitor safely to try to recycle
-    // the connection it's holding.  We share the pools with the monitor,
-    // so it's not safe to hold a mutable reference when yielding.
-    if let Some(requester) = requester {
-        let (sender, receiver) = oneshot::channel();
-        println!("Requesting connection from monitor");
-        // It's possible for this to fail if the connection was broken and we
-        // managed to take the connection requester from the pools before the
-        // worker got around to it.
-        if requester.send(sender).is_err() {
-            println!("Connection was broken");
-            None
-        } else {
-            println!("Waiting for connection");
-            // It's possible for this to fail if the connection is broken
-            // while we're waiting for the monitor to receive our request
-            // for the connection.
-            let connection = receiver
-                .await // <-- Make sure we're not holding the pools here!
-                .unwrap_or(None);
-            if connection.is_some() {
-                println!("Got a connection");
-            } else {
-                println!("Connection was broken");
-            }
-            connection
-        }
-    } else {
-        None
     }
 }
 
 async fn worker<K, V>(
     receiver: mpsc::UnboundedReceiver<WorkerMessage<K, V>>
 )
-    where K: Debug + Eq + Hash,
+    where K: Eq + Hash,
         V: Perishable
 {
-    println!("Worker started");
+    // The worker thread makes the root storage for the monitors, which hold
+    // stored values, and requesters, which are used to retrieve them.
+    // These are shared between separate futures:
     let pools = Rc::new(RefCell::new(ParkedValuePools::new()));
     futures::select!(
+        // Handle incoming messages to the worker thread, such as to stop,
+        // store a new value, or try to retrieve back a value previously
+        // stored.
         () = handle_messages(pools.clone(), receiver).fuse() => (),
+
+        // Drive monitor futures to completion, which either deliver the values
+        // back out or drop them if they have perished.
         () = monitor_values(pools).fuse() => (),
     );
-    println!("Worker stopping");
 }
 
 enum WorkerMessage<K, V> {
+    // This tells the worker thread to stop.
     Stop,
-    Take{
+
+    // This takes a value and stores it in the pantry.
+    Take {
         key: K,
         value: V,
     },
-    Give{
+
+    // This requests that a previously-stored value be retrieved
+    // and delivered back through the provided oneshot sender.
+    Give {
         key: K,
         return_sender: Sender<V>,
     },
@@ -371,12 +419,15 @@ enum WorkerMessage<K, V> {
 /// [`fetch`]: #method.fetch
 /// [`store`]: #method.store
 pub struct Pantry<K, V> {
+    // This sender is used to deliver messages to the worker thread.
     work_in: mpsc::UnboundedSender<WorkerMessage<K, V>>,
+
+    // This is our handle to join the worker thread when dropped.
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl<K, V> Pantry<K, V>
-    where K: Debug + Eq + Hash + Send + 'static,
+    where K: Eq + Hash + Send + 'static,
         V: Perishable
 {
     /// Create a new `Pantry` with no values in it.  This spawns the worker
@@ -384,7 +435,11 @@ impl<K, V> Pantry<K, V>
     /// be dropped.
     #[must_use]
     pub fn new() -> Self {
-        let (sender, receiver) = mpsc::unbounded::<WorkerMessage<K, V>>();
+        // Make the channel used to communicate with the worker thread.
+        let (sender, receiver) = mpsc::unbounded();
+
+        // Store the sender end of the channel and spawn the worker thread,
+        // giving it the receiver end.
         Self {
             work_in: sender,
             worker: Some(thread::spawn(|| executor::block_on(worker(receiver)))),
@@ -401,6 +456,9 @@ impl<K, V> Pantry<K, V>
         key: K,
         value: V,
     ) {
+        // Tell the worker thread to take the value and associate the key with
+        // it.
+        //
         // It shouldn't be possible for this to fail, since the worker holds
         // the receiver for this channel, and isn't dropped until the client
         // itself is dropped.  So if it does fail, we want to know about it
@@ -426,7 +484,9 @@ impl<K, V> Pantry<K, V>
         key: K,
     ) -> Option<V> {
         let (sender, receiver) = oneshot::channel();
-        println!("Trying to fetch value with {:?}", key);
+
+        // Tell the worker thread to give us a value matching the key.
+        //
         // It shouldn't be possible for this to fail, since the worker holds
         // the receiver for this channel, and isn't dropped until the client
         // itself is dropped.  So if it does fail, we want to know about it
@@ -435,20 +495,18 @@ impl<K, V> Pantry<K, V>
             key,
             return_sender: sender
         }).unwrap();
-        // This can fail if the connection is broken before the monitor
-        // receives our request for the connection.
-        let connection = receiver.await.unwrap_or(None);
-        if connection.is_some() {
-            println!("Got a value");
-        } else {
-            println!("No value available");
-        }
-        connection
+
+        // Wait for the worker thread to either give us the value back or tell
+        // us it didn't have one to give us.
+        //
+        // This can fail if the value has perished before the monitor
+        // receives our request for the value.
+        receiver.await.unwrap_or(None)
     }
 }
 
 impl<K, V> Default for Pantry<K, V>
-    where K: Debug + Eq + Hash + Send + 'static,
+    where K: Eq + Hash + Send + 'static,
         V: Perishable
 {
     fn default() -> Self {
@@ -458,16 +516,18 @@ impl<K, V> Default for Pantry<K, V>
 
 impl<K, V> Drop for Pantry<K, V> {
     fn drop(&mut self) {
-        println!("Sending stop message");
+        // Tell the worker thread to stop.
+        //
         // It shouldn't be possible for this to fail, since the worker holds
         // the receiver for this channel, and we haven't joined or dropped the
         // worker yet (we will a few lines later).  So if it does fail, we want
         // to know about it since it would mean we have a bug.
         self.work_in.unbounded_send(WorkerMessage::Stop).unwrap();
-        println!("Joining worker thread");
+
+        // Join the worker thread.
+        //
         // This shouldn't fail unless the worker panics.  If it does, there's
         // no reason why we shouldn't panic as well.
         self.worker.take().unwrap().join().unwrap();
-        println!("Worker thread joined");
     }
 }
