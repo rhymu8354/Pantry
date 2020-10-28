@@ -1,0 +1,15 @@
+[package]
+name = "pantry"
+version = "1.0.0"
+description = "Temporary storage for reusing values that may decay"
+authors = ["Richard Walters <rwalters@digitalstirling.com>"]
+edition = "2018"
+license = "MIT"
+readme = "README.md"
+categories = ["asynchronous", "caching"]
+keywords = ["cache", "caching", "reuse", "futures"]
+repository = "https://github.com/rhymu8354/Pantry.git"
+
+[dependencies]
+async-trait = "0.1"
+futures = "0.3"
