@@ -32,3 +32,9 @@ stored using the same key and has not decayed since it was stored.
 Multiple values may have the same key, with the caveat that the values stored
 under a given key may not be returned in the same order in which they were
 stored.
+
+## Formatting
+
+This crate uses a custom configuration for `rustfmt` which relies on unstable
+features.  Attempting `cargo fmt` on the stable toolchain may fail.  Use `cargo
++nightly fmt` to format the code.

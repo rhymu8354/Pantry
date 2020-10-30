@@ -43,8 +43,8 @@ use futures::{
 use std::{
     cell::RefCell,
     collections::{
-        HashMap,
         hash_map,
+        HashMap,
     },
     hash::Hash,
     pin::Pin,
@@ -78,8 +78,10 @@ type Requestee<V> = oneshot::Receiver<Sender<V>>;
 ///         // sitting in the pantry for 5 seconds!
 ///         async_std::future::timeout(
 ///             std::time::Duration::from_secs(5),
-///             futures::future::pending::<()>()
-///         ).await.unwrap_or(())
+///             futures::future::pending::<()>(),
+///         )
+///         .await
+///         .unwrap_or(())
 ///     }
 /// }
 /// ```
@@ -108,7 +110,8 @@ async fn monitor_value<V>(
     mut value: V,
     receiver: Requestee<V>,
 ) -> MonitorKind
-    where V: Perishable
+where
+    V: Perishable,
 {
     // The monitor completes if either of the following completes:
     futures::select!(
@@ -147,11 +150,12 @@ enum MonitorKind {
 
 struct ParkedValuePool<V> {
     requesters: Vec<Requester<V>>,
-    monitors: Vec<Pin<Box<dyn Future<Output=MonitorKind>>>>,
+    monitors: Vec<Pin<Box<dyn Future<Output = MonitorKind>>>>,
 }
 
 impl<V> ParkedValuePool<V>
-    where V: Perishable
+where
+    V: Perishable,
 {
     fn add(
         &mut self,
@@ -207,8 +211,9 @@ async fn give_parked_value<K, V>(
     pools: &RefCell<ParkedValuePools<K, V>>,
     key: K,
 ) -> Option<V>
-    where K: Eq + Hash,
-        V: Perishable
+where
+    K: Eq + Hash,
+    V: Perishable,
 {
     // Remove requester from the pools.
     let requester = match pools.borrow_mut().pools.entry(key) {
@@ -244,12 +249,15 @@ fn take_parked_value<K, V>(
     pools: &RefCell<ParkedValuePools<K, V>>,
     key: K,
     value: V,
-)
-    where K: Eq + Hash,
-        V: Perishable
+) where
+    K: Eq + Hash,
+    V: Perishable,
 {
     // First store the value and create the monitor for it.
-    pools.borrow_mut().pools.entry(key)
+    pools
+        .borrow_mut()
+        .pools
+        .entry(key)
         .or_insert_with(ParkedValuePool::new)
         .add(value);
 
@@ -268,17 +276,17 @@ fn take_parked_value<K, V>(
 
 async fn handle_messages<K, V>(
     pools: &RefCell<ParkedValuePools<K, V>>,
-    receiver: mpsc::UnboundedReceiver<WorkerMessage<K, V>>
-)
-    where K: Eq + Hash,
-        V: Perishable
+    receiver: mpsc::UnboundedReceiver<WorkerMessage<K, V>>,
+) where
+    K: Eq + Hash,
+    V: Perishable,
 {
     // Drive to completion the stream of messages to the worker thread.
     receiver
         // The special `Stop` message completes the stream.
-        .take_while(|message| future::ready(
-            !matches!(message, WorkerMessage::Stop)
-        ))
+        .take_while(|message| {
+            future::ready(!matches!(message, WorkerMessage::Stop))
+        })
 
         // Handle messages other than `Stop`.
         .for_each(|message| async {
@@ -288,10 +296,7 @@ async fn handle_messages<K, V>(
                 WorkerMessage::Stop => unreachable!(),
 
                 // Taking a value to store in the pantry is easy.
-                WorkerMessage::Take{
-                    key,
-                    value,
-                } => {
+                WorkerMessage::Take { key, value } => {
                     take_parked_value(pools, key, value);
                 },
 
@@ -300,28 +305,25 @@ async fn handle_messages<K, V>(
                 // Getting it back out requires that we signal the monitor to
                 // pass back ownership.  Once we get it we deliver it back
                 // through the oneshot sender provided with the `Give` message.
-                // It's possible we have nothing to give back, so what we
-                // send back is an `Option<V>` not a `V`.
-                WorkerMessage::Give{
-                    key,
-                    return_sender,
-                } => {
+                // It's possible we have nothing to give back, so what we send
+                // back is an `Option<V>` not a `V`.
+                WorkerMessage::Give { key, return_sender } => {
                     // It's possible for this to fail if the user gave up on a
                     // transaction before the worker was able to recycle a
                     // value for use in sending the request.  If this
                     // happens, the value is simply dropped.
-                    return_sender.send(
-                        give_parked_value(pools, key).await
-                    ).unwrap_or(());
-                },
+                    return_sender
+                        .send(give_parked_value(pools, key).await)
+                        .unwrap_or(());
+                }
             }
-        }).await
+        })
+        .await
 }
 
-async fn monitor_values<K, V>(
-    pools: &RefCell<ParkedValuePools<K, V>>,
-)
-    where K: Eq + Hash
+async fn monitor_values<K, V>(pools: &RefCell<ParkedValuePools<K, V>>)
+where
+    K: Eq + Hash,
 {
     let mut monitors = Vec::new();
     let mut needs_kick = true;
@@ -329,20 +331,15 @@ async fn monitor_values<K, V>(
         // Add to our collection any monitors that have been created since the
         // last loop.  The first loop picks up any monitors created before the
         // worker thread actually started.
-        monitors.extend(
-            pools.borrow_mut().pools.iter_mut()
-                .flat_map(|(_, pool)| {
-                    pool.requesters.retain(|requester|
-                        !requester.is_canceled()
-                    );
-                    pool.monitors.drain(..)
-                })
-        );
+        monitors.extend(pools.borrow_mut().pools.iter_mut().flat_map(
+            |(_, pool)| {
+                pool.requesters.retain(|requester| !requester.is_canceled());
+                pool.monitors.drain(..)
+            },
+        ));
 
         // Drop any empty requester collections.
-        pools.borrow_mut().pools.retain(|_, pool|
-            !pool.requesters.is_empty()
-        );
+        pools.borrow_mut().pools.retain(|_, pool| !pool.requesters.is_empty());
 
         // Add a special future we lovingly call the "kick", if we haven't
         // added it yet or if the last one completed.  This future completes if
@@ -371,16 +368,16 @@ async fn monitor_values<K, V>(
                 // The output indicates that this is the "kick" future used
                 // to wake the worker thread to collect more monitors.
                 MonitorKind::Kick
-            }.boxed();
+            }
+            .boxed();
 
             // Add the "kick" future to our collection.
             monitors.push(kick_future);
         }
 
         // Wait until a monitor or the "kick" completes.
-        let (monitor_kind, _, monitors_left) = future::select_all(
-            monitors.into_iter()
-        ).await;
+        let (monitor_kind, _, monitors_left) =
+            future::select_all(monitors.into_iter()).await;
 
         // If it was the "kick" future which completed, mark that we will
         // need to make a new "kick" for the next loop.
@@ -391,11 +388,10 @@ async fn monitor_values<K, V>(
     }
 }
 
-async fn worker<K, V>(
-    receiver: mpsc::UnboundedReceiver<WorkerMessage<K, V>>
-)
-    where K: Eq + Hash,
-        V: Perishable
+async fn worker<K, V>(receiver: mpsc::UnboundedReceiver<WorkerMessage<K, V>>)
+where
+    K: Eq + Hash,
+    V: Perishable,
 {
     // The worker thread makes the root storage for the monitors, which hold
     // stored values, and requesters, which are used to retrieve them.
@@ -450,14 +446,16 @@ enum WorkerMessage<K, V> {
 /// # extern crate pantry;
 /// use async_trait::async_trait;
 /// use futures::executor::block_on;
-/// use pantry::{Pantry, Perishable};
+/// use pantry::{
+///     Pantry,
+///     Perishable,
+/// };
 /// use std::time::Duration;
 ///
 /// async fn delay_async(duration: Duration) {
-///     async_std::future::timeout(
-///         duration,
-///         futures::future::pending::<()>()
-///     ).await.unwrap_or(())
+///     async_std::future::timeout(duration, futures::future::pending::<()>())
+///         .await
+///         .unwrap_or(())
 /// }
 ///
 /// fn delay(duration: Duration) {
@@ -504,8 +502,9 @@ pub struct Pantry<K, V> {
 }
 
 impl<K, V> Pantry<K, V>
-    where K: Eq + Hash + Send + 'static,
-        V: Perishable
+where
+    K: Eq + Hash + Send + 'static,
+    V: Perishable,
 {
     /// Create a new `Pantry` with no values in it.  This spawns the worker
     /// thread which monitors values added to it and detects when they should
@@ -519,7 +518,9 @@ impl<K, V> Pantry<K, V>
         // giving it the receiver end.
         Self {
             work_in: sender,
-            worker: Some(thread::spawn(|| executor::block_on(worker(receiver)))),
+            worker: Some(thread::spawn(|| {
+                executor::block_on(worker(receiver))
+            })),
         }
     }
 
@@ -540,10 +541,12 @@ impl<K, V> Pantry<K, V>
         // the receiver for this channel, and isn't dropped until the client
         // itself is dropped.  So if it does fail, we want to know about it
         // since it would mean we have a bug.
-        self.work_in.unbounded_send(WorkerMessage::Take{
-            key,
-            value
-        }).unwrap();
+        self.work_in
+            .unbounded_send(WorkerMessage::Take {
+                key,
+                value,
+            })
+            .unwrap();
     }
 
     /// Attempt to retrieve the value previously stored with [`store`] using
@@ -568,10 +571,12 @@ impl<K, V> Pantry<K, V>
         // the receiver for this channel, and isn't dropped until the client
         // itself is dropped.  So if it does fail, we want to know about it
         // since it would mean we have a bug.
-        self.work_in.unbounded_send(WorkerMessage::Give{
-            key,
-            return_sender: sender
-        }).unwrap();
+        self.work_in
+            .unbounded_send(WorkerMessage::Give {
+                key,
+                return_sender: sender,
+            })
+            .unwrap();
 
         // Wait for the worker thread to either give us the value back or tell
         // us it didn't have one to give us.
@@ -583,8 +588,9 @@ impl<K, V> Pantry<K, V>
 }
 
 impl<K, V> Default for Pantry<K, V>
-    where K: Eq + Hash + Send + 'static,
-        V: Perishable
+where
+    K: Eq + Hash + Send + 'static,
+    V: Perishable,
 {
     fn default() -> Self {
         Self::new()
@@ -611,21 +617,18 @@ impl<K, V> Drop for Pantry<K, V> {
 
 #[cfg(test)]
 mod tests {
-
     use super::*;
 
-    struct MockPerishable{
+    struct MockPerishable {
         num: usize,
         perish: Option<oneshot::Receiver<()>>,
         dropped: Option<oneshot::Sender<()>>,
     }
 
     impl MockPerishable {
-        fn perishable(num: usize) -> (
-            Self,
-            oneshot::Sender<()>,
-            oneshot::Receiver<()>,
-        ) {
+        fn perishable(
+            num: usize
+        ) -> (Self, oneshot::Sender<()>, oneshot::Receiver<()>) {
             let (perish_sender, perish_receiver) = oneshot::channel();
             let (dropped_sender, dropped_receiver) = oneshot::channel();
             let value = Self {
@@ -635,6 +638,7 @@ mod tests {
             };
             (value, perish_sender, dropped_receiver)
         }
+
         fn not_perishable(num: usize) -> Self {
             Self {
                 num,
@@ -669,9 +673,8 @@ mod tests {
         let value = MockPerishable::not_perishable(1337);
         let key = 42;
         pantry.store(key, value);
-        let value = futures::executor::block_on(async {
-            pantry.fetch(key).await
-        });
+        let value =
+            futures::executor::block_on(async { pantry.fetch(key).await });
         assert!(value.is_some());
         assert_eq!(1337, value.unwrap().num);
     }
@@ -680,9 +683,8 @@ mod tests {
     fn fetch_without_store() {
         let pantry: Pantry<usize, MockPerishable> = Pantry::new();
         let key = 42;
-        let value = futures::executor::block_on(async {
-            pantry.fetch(key).await
-        });
+        let value =
+            futures::executor::block_on(async { pantry.fetch(key).await });
         assert!(value.is_none());
     }
 
@@ -692,14 +694,12 @@ mod tests {
         let value = MockPerishable::not_perishable(1337);
         let key = 42;
         pantry.store(key, value);
-        let value = futures::executor::block_on(async {
-            pantry.fetch(key).await
-        });
+        let value =
+            futures::executor::block_on(async { pantry.fetch(key).await });
         assert!(value.is_some());
         assert_eq!(1337, value.unwrap().num);
-        let value = futures::executor::block_on(async {
-            pantry.fetch(key).await
-        });
+        let value =
+            futures::executor::block_on(async { pantry.fetch(key).await });
         assert!(value.is_none());
     }
 
@@ -711,18 +711,15 @@ mod tests {
         let key = 42;
         pantry.store(key, value1);
         pantry.store(key, value2);
-        let value1 = futures::executor::block_on(async {
-            pantry.fetch(key).await
-        });
-        let value2 = futures::executor::block_on(async {
-            pantry.fetch(key).await
-        });
+        let value1 =
+            futures::executor::block_on(async { pantry.fetch(key).await });
+        let value2 =
+            futures::executor::block_on(async { pantry.fetch(key).await });
         assert!(value1.is_some());
         assert!(value2.is_some());
         assert!(matches!(
             (value1.unwrap().num, value2.unwrap().num),
-            (1337, 85)
-            | (85, 1337)
+            (1337, 85) | (85, 1337)
         ));
     }
 
@@ -735,12 +732,10 @@ mod tests {
         let key2 = 33;
         pantry.store(key1, value1);
         pantry.store(key2, value2);
-        let value1 = futures::executor::block_on(async {
-            pantry.fetch(key1).await
-        });
-        let value2 = futures::executor::block_on(async {
-            pantry.fetch(key2).await
-        });
+        let value1 =
+            futures::executor::block_on(async { pantry.fetch(key1).await });
+        let value2 =
+            futures::executor::block_on(async { pantry.fetch(key2).await });
         assert!(value1.is_some());
         assert!(value2.is_some());
         assert!(matches!(
@@ -756,12 +751,9 @@ mod tests {
         let key = 42;
         pantry.store(key, value);
         assert!(perish.send(()).is_ok());
-        assert!(futures::executor::block_on(async {
-            dropped.await
-        }).is_ok());
-        let value = futures::executor::block_on(async {
-            pantry.fetch(key).await
-        });
+        assert!(futures::executor::block_on(async { dropped.await }).is_ok());
+        let value =
+            futures::executor::block_on(async { pantry.fetch(key).await });
         assert!(value.is_none());
     }
 
@@ -771,9 +763,8 @@ mod tests {
         let (value, perish, dropped) = MockPerishable::perishable(1337);
         let key = 42;
         pantry.store(key, value);
-        let value = futures::executor::block_on(async {
-            pantry.fetch(key).await
-        });
+        let value =
+            futures::executor::block_on(async { pantry.fetch(key).await });
         assert!(dropped.now_or_never().is_none());
         drop(perish);
         assert!(value.is_some());
@@ -789,18 +780,13 @@ mod tests {
         pantry.store(key, value1);
         pantry.store(key, value2);
         assert!(perish.send(()).is_ok());
-        assert!(futures::executor::block_on(async {
-            dropped.await
-        }).is_ok());
-        let value1 = futures::executor::block_on(async {
-            pantry.fetch(key).await
-        });
-        let value2 = futures::executor::block_on(async {
-            pantry.fetch(key).await
-        });
+        assert!(futures::executor::block_on(async { dropped.await }).is_ok());
+        let value1 =
+            futures::executor::block_on(async { pantry.fetch(key).await });
+        let value2 =
+            futures::executor::block_on(async { pantry.fetch(key).await });
         assert!(value1.is_some());
         assert!(value2.is_none());
         assert_eq!(85, value1.unwrap().num);
     }
-
 }
