@@ -38,3 +38,7 @@ stored.
 This crate uses a custom configuration for `rustfmt` which relies on unstable
 features.  Attempting `cargo fmt` on the stable toolchain may fail.  Use `cargo
 +nightly fmt` to format the code.
+
+## License
+
+Licensed under the [MIT license](LICENSE.txt).
