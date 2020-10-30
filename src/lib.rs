@@ -48,7 +48,6 @@ use std::{
     },
     hash::Hash,
     pin::Pin,
-    rc::Rc,
     thread,
 };
 
@@ -205,7 +204,7 @@ impl<K, V> ParkedValuePools<K, V> {
 }
 
 async fn give_parked_value<K, V>(
-    pools: &Rc<RefCell<ParkedValuePools<K, V>>>,
+    pools: &RefCell<ParkedValuePools<K, V>>,
     key: K,
 ) -> Option<V>
     where K: Eq + Hash,
@@ -242,7 +241,7 @@ async fn give_parked_value<K, V>(
 }
 
 fn take_parked_value<K, V>(
-    pools: &Rc<RefCell<ParkedValuePools<K, V>>>,
+    pools: &RefCell<ParkedValuePools<K, V>>,
     key: K,
     value: V,
 )
@@ -268,7 +267,7 @@ fn take_parked_value<K, V>(
 }
 
 async fn handle_messages<K, V>(
-    pools: Rc<RefCell<ParkedValuePools<K, V>>>,
+    pools: &RefCell<ParkedValuePools<K, V>>,
     receiver: mpsc::UnboundedReceiver<WorkerMessage<K, V>>
 )
     where K: Eq + Hash,
@@ -293,7 +292,7 @@ async fn handle_messages<K, V>(
                     key,
                     value,
                 } => {
-                    take_parked_value(&pools, key, value);
+                    take_parked_value(pools, key, value);
                 },
 
                 // Giving a value back out is more difficult.  The monitor
@@ -312,7 +311,7 @@ async fn handle_messages<K, V>(
                     // value for use in sending the request.  If this
                     // happens, the value is simply dropped.
                     return_sender.send(
-                        give_parked_value(&pools, key).await
+                        give_parked_value(pools, key).await
                     ).unwrap_or(());
                 },
             }
@@ -320,7 +319,7 @@ async fn handle_messages<K, V>(
 }
 
 async fn monitor_values<K, V>(
-    pools: Rc<RefCell<ParkedValuePools<K, V>>>,
+    pools: &RefCell<ParkedValuePools<K, V>>,
 )
     where K: Eq + Hash
 {
@@ -401,16 +400,16 @@ async fn worker<K, V>(
     // The worker thread makes the root storage for the monitors, which hold
     // stored values, and requesters, which are used to retrieve them.
     // These are shared between separate futures:
-    let pools = Rc::new(RefCell::new(ParkedValuePools::new()));
+    let pools = RefCell::new(ParkedValuePools::new());
     futures::select!(
         // Handle incoming messages to the worker thread, such as to stop,
         // store a new value, or try to retrieve back a value previously
         // stored.
-        () = handle_messages(pools.clone(), receiver).fuse() => (),
+        () = handle_messages(&pools, receiver).fuse() => (),
 
         // Drive monitor futures to completion, which either deliver the values
         // back out or drop them if they have perished.
-        () = monitor_values(pools).fuse() => (),
+        () = monitor_values(&pools).fuse() => (),
     );
 }
 
