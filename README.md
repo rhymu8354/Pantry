@@ -2,6 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/pantry.svg)](https://crates.io/crates/pantry)
 [![Documentation](https://docs.rs/pantry/badge.svg)][dox]
+[![cargo test and fmt check](https://github.com/rhymu8354/Pantry/workflows/cargo%20test%20and%20fmt%20check/badge.svg)](https://github.com/rhymu8354/Pantry/actions)
 
 The `Pantry` is useful for temporarily storing for later use values that
 might "decay" (become unusable) over time, such as:
