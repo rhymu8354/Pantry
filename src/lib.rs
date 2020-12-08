@@ -159,7 +159,7 @@ where
     #![allow(clippy::mut_mut)]
     futures::select!(
         // The value has perished.
-        _ = value.perished().fuse() => (),
+        _ = value.perished().fuse() => {},
 
         // The value has been requested to be fetched back out,
         // or the requester for the value has been dropped.
